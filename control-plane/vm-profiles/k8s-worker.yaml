@@ -1,0 +1,14 @@
+config:
+  limits.cpu: "8"
+  limits.memory: 2GiB
+description: ""
+devices:
+  eth0:
+    name: eth0
+    network: k8sbr0
+    type: nic
+  root:
+    path: /
+    pool: default
+    type: disk
+name: k8s-worker

@@ -1,0 +1,17 @@
+{
+  "CN": "kube-apiserver",
+  "hosts": [
+    "127.0.0.1",
+    "10.240.0.20",
+    "10.240.0.21",
+    "10.32.0.1",
+    "kubernetes",
+    "kubernetes.default",
+    "kubernetes.default.svc",
+    "kubernetes.default.svc.cluster.local"
+  ],
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  }
+}

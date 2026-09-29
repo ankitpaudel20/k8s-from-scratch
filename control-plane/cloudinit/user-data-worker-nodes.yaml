@@ -1,0 +1,285 @@
+#cloud-config
+swap:
+  filename: /swapfile
+  size: "1G"
+  maxsize: "1G"
+
+package_update: true
+packages:
+  - socat
+  - conntrack
+  - ipset
+  - iptables
+  - curl
+  - tar
+  - apt-transport-https
+  - ebtables
+  - ethtool
+
+write_files:
+  # ----------------------------------------------------------------------------
+  # 1. Kernel Modules & Sysctl
+  # ----------------------------------------------------------------------------
+  - path: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+
+  - path: /etc/sysctl.d/99-k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward = 1
+      vm.swappiness = 5
+
+  # ----------------------------------------------------------------------------
+  # 2. Containerd Configuration (CRI with systemd cgroups)
+  # ----------------------------------------------------------------------------
+  - path: /etc/containerd/config.toml
+    content: |
+      version = 2
+      [plugins]
+        [plugins."io.containerd.grpc.v1.cri"]
+          sandbox_image = "registry.k8s.io/pause:3.10"
+          [plugins."io.containerd.grpc.v1.cri".containerd]
+            default_runtime_name = "runc"
+            [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+              [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                runtime_type = "io.containerd.runc.v2"
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                  SystemdCgroup = true
+
+  # ----------------------------------------------------------------------------
+  # 3. crictl CLI Configuration
+  # ----------------------------------------------------------------------------
+  - path: /etc/crictl.yaml
+    content: |
+      runtime-endpoint: unix:///run/containerd/containerd.sock
+      image-endpoint: unix:///run/containerd/containerd.sock
+      timeout: 10
+      debug: false
+
+  # ----------------------------------------------------------------------------
+  # 4. containerd Systemd Service Unit
+  # ----------------------------------------------------------------------------
+  - path: /etc/systemd/system/containerd.service
+    content: |
+      [Unit]
+      Description=containerd container runtime
+      Documentation=https://containerd.io
+      After=network.target local-fs.target
+
+      [Service]
+      ExecStartPre=-/sbin/modprobe overlay
+      ExecStart=/usr/local/bin/containerd
+
+      Type=notify
+      Delegate=yes
+      KillMode=process
+      Restart=always
+      RestartSec=5
+      LimitNPROC=infinity
+      LimitCORE=infinity
+      LimitNOFILE=infinity
+      TasksMax=infinity
+      OOMScoreAdjust=-999
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # ----------------------------------------------------------------------------
+  # 5. kubelet Systemd Service Unit
+  # ----------------------------------------------------------------------------
+  - path: /etc/systemd/system/kubelet.service
+    content: |
+      [Unit]
+      Description=Kubernetes Kubelet
+      Documentation=https://github.com/kubernetes/kubernetes
+      After=containerd.service
+      Requires=containerd.service
+
+      [Service]
+      ExecStart=/usr/local/bin/kubelet \
+        --config=/var/lib/kubelet/kubelet-config.yaml \
+        --kubeconfig=/var/lib/kubelet/kubeconfig \
+        --register-node=true \
+        --v=2
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # ----------------------------------------------------------------------------
+  # 6. kube-proxy Systemd Service Unit
+  # ----------------------------------------------------------------------------
+  - path: /etc/systemd/system/kube-proxy.service
+    content: |
+      [Unit]
+      Description=Kubernetes Kube Proxy
+      Documentation=https://github.com/kubernetes/kubernetes
+      After=network.target
+
+      [Service]
+      ExecStart=/usr/local/bin/kube-proxy \
+        --config=/var/lib/kube-proxy/kube-proxy-config.yaml \
+        --v=2
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - |
+    set -euo pipefail
+
+    # 1. Apply Kernel modules and sysctl configurations
+    modprobe overlay
+    modprobe br_netfilter
+    sysctl --system
+
+    # 2. Derive Node Identity and Pod Subnet CIDR
+    NODE_NAME=$(hostname -s)
+    NODE_INDEX=$(echo "${NODE_NAME}" | cut -d'-' -f2)
+    POD_CIDR="10.200.${NODE_INDEX}.0/24"
+    HOST_SERVER="http://10.240.0.1:8080"
+    KUBE_APISERVER="https://10.240.0.20:6443"
+
+    echo "==> Bootstrapping worker node: ${NODE_NAME} (Index: ${NODE_INDEX}, Pod CIDR: ${POD_CIDR})"
+
+    # 3. Create required runtime directories
+    mkdir -p /var/lib/kubelet \
+             /var/lib/kube-proxy \
+             /var/lib/kubernetes \
+             /var/run/kubernetes \
+             /etc/containerd \
+             /usr/local/bin \
+             /usr/local/sbin
+
+    echo "==> Fetching containerd..."
+    curl -fsSL "${HOST_SERVER}/binaries/containerd.tar.gz" | tar -C /usr/local -xz
+
+    echo "==> Fetching runc..."
+    curl -fsSL -o /usr/local/sbin/runc "${HOST_SERVER}/binaries/runc.amd64"
+    chmod +x /usr/local/sbin/runc
+
+    echo "==> Fetching crictl..."
+    curl -fsSL "${HOST_SERVER}/binaries/crictl.tar.gz" | tar -C /usr/local/bin -xz
+    chmod +x /usr/local/bin/crictl
+
+    echo "==> Fetching Kubernetes node binaries..."
+    curl -fsSL -o /usr/local/bin/kubelet "${HOST_SERVER}/binaries/kubelet"
+    curl -fsSL -o /usr/local/bin/kube-proxy "${HOST_SERVER}/binaries/kube-proxy"
+    curl -fsSL -o /usr/local/bin/kubectl "${HOST_SERVER}/binaries/kubectl"
+    chmod +x /usr/local/bin/kubelet /usr/local/bin/kube-proxy /usr/local/bin/kubectl
+
+    echo "==> Fetching helm..."
+    curl -sSL "${HOST_SERVER}/binaries/helm.tar.gz" -o /tmp/helm.tar.gz
+    tar -xzf /tmp/helm.tar.gz -C /tmp/
+    find /tmp -type f -name "helm" -exec mv {} /usr/local/bin/ \;
+
+    # 5. Fetch Root CA and node certificates
+    echo "==> Fetching certificates from ${HOST_SERVER}/pki/..."
+    echo "==> Fetching root-ca ..."
+    curl -fsSL -o /var/lib/kubernetes/root-ca.pem "${HOST_SERVER}/pki/root-ca/root-ca.pem"
+    echo "==> Fetching ${NODE_NAME} certs ..."
+    curl -fsSL -o /var/lib/kubelet/${NODE_NAME}.pem "${HOST_SERVER}/pki/${NODE_NAME}/${NODE_NAME}.pem"
+    curl -fsSL -o /var/lib/kubelet/${NODE_NAME}-key.pem "${HOST_SERVER}/pki/${NODE_NAME}/${NODE_NAME}-key.pem"
+    chmod 600 /var/lib/kubelet/${NODE_NAME}-key.pem
+
+    echo "==> Fetching kube-proxy certs ..."
+    curl -fsSL -o /var/lib/kube-proxy/kube-proxy.pem "${HOST_SERVER}/pki/kube-proxy/kube-proxy.pem"
+    curl -fsSL -o /var/lib/kube-proxy/kube-proxy-key.pem "${HOST_SERVER}/pki/kube-proxy/kube-proxy-key.pem"
+    chmod 600 /var/lib/kube-proxy/kube-proxy-key.pem
+
+
+    # 7. Generate kubelet.kubeconfig
+    cat  << EOF > /var/lib/kubelet/kubeconfig
+      apiVersion: v1
+      kind: Config
+      clusters:
+      - cluster:
+          certificate-authority: /var/lib/kubernetes/root-ca.pem
+          server: "${KUBE_APISERVER}"
+        name: local-cluster
+      contexts:
+      - context:
+          cluster: local-cluster
+          user: "system:node:${NODE_NAME}"
+        name: default
+      current-context: default
+      users:
+      - name: "system:node:${NODE_NAME}"
+        user:
+          client-certificate: "/var/lib/kubelet/${NODE_NAME}.pem"
+          client-key: "/var/lib/kubelet/${NODE_NAME}-key.pem"
+    EOF
+
+    # 8. Generate kubelet-config.yaml
+    RESOLV_CONF="/etc/resolv.conf"
+    if [ -f /run/systemd/resolve/resolv.conf ]; then
+      RESOLV_CONF="/run/systemd/resolve/resolv.conf"
+    fi
+
+    cat <<EOF > /var/lib/kubelet/kubelet-config.yaml
+      kind: KubeletConfiguration
+      apiVersion: kubelet.config.k8s.io/v1beta1
+      authentication:
+        anonymous:
+          enabled: false
+        webhook:
+          enabled: true
+        x509:
+          clientCAFile: /var/lib/kubernetes/root-ca.pem
+      authorization:
+        mode: Webhook
+      clusterDomain: cluster.local
+      clusterDNS:
+        - 10.32.0.10
+      cgroupDriver: systemd
+      containerRuntimeEndpoint: unix:///run/containerd/containerd.sock
+      failSwapOn: false
+      resolvConf: ${RESOLV_CONF}
+      runtimeRequestTimeout: 15m
+      serializeImagePulls: false
+      tlsCertFile: /var/lib/kubelet/${NODE_NAME}.pem
+      tlsPrivateKeyFile: /var/lib/kubelet/${NODE_NAME}-key.pem
+    EOF
+
+    # 9. Generate kube-proxy.kubeconfig
+    cat  << EOF > /var/lib/kube-proxy/kubeconfig
+      apiVersion: v1
+      kind: Config
+      clusters:
+      - cluster:
+          certificate-authority: /var/lib/kubernetes/root-ca.pem
+          server: "${KUBE_APISERVER}"
+        name: local-cluster
+      contexts:
+      - context:
+          cluster: local-cluster
+          user: system:kube-proxy
+        name: default
+      current-context: default
+      users:
+      - name: system:kube-proxy
+        user:
+          client-certificate: /var/lib/kube-proxy/kube-proxy.pem
+          client-key: /var/lib/kube-proxy/kube-proxy-key.pem
+    EOF
+
+
+    # 10. Generate kube-proxy-config.yaml
+    cat <<EOF > /var/lib/kube-proxy/kube-proxy-config.yaml
+      kind: KubeProxyConfiguration
+      apiVersion: kubeproxy.config.k8s.io/v1alpha1
+      clientConnection:
+        kubeconfig: /var/lib/kube-proxy/kubeconfig
+      mode: iptables
+      clusterCIDR: 10.200.0.0/16
+    EOF
+
+    # 11. Start and enable worker services
+    systemctl daemon-reload
+    systemctl enable --now containerd kubelet kube-proxy

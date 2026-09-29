@@ -1,0 +1,294 @@
+#cloud-config
+swap:
+  filename: /swapfile
+  size: "1G"
+  maxsize: "1G"
+
+package_update: true
+packages:
+  - socat
+  - conntrack
+  - ipset
+  - curl
+  - tar
+  - apt-transport-https
+
+write_files:
+  - path: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+
+  - path: /etc/sysctl.d/99-k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward = 1
+      vm.swappiness = 5
+
+  # ----------------------------------------------------------------------------
+  # Kube-Scheduler Component Configuration File
+  # ----------------------------------------------------------------------------
+  - path: /etc/kubernetes/config/kube-scheduler.yaml
+    content: |
+      apiVersion: kubescheduler.config.k8s.io/v1
+      kind: KubeSchedulerConfiguration
+      clientConnection:
+        kubeconfig: "/var/lib/kubernetes/kube-scheduler.kubeconfig"
+      leaderElection:
+        leaderElect: true
+
+  # ----------------------------------------------------------------------------
+  # Kubeconfig: kube-controller-manager
+  # ----------------------------------------------------------------------------
+  - path: /var/lib/kubernetes/kube-controller-manager.kubeconfig
+    permissions: "0600"
+    content: |
+      apiVersion: v1
+      kind: Config
+      clusters:
+      - cluster:
+          certificate-authority: /var/lib/kubernetes/root-ca.pem
+          server: https://127.0.0.1:6443
+        name: local-cluster
+      contexts:
+      - context:
+          cluster: local-cluster
+          user: system:kube-controller-manager
+        name: default
+      current-context: default
+      users:
+      - name: system:kube-controller-manager
+        user:
+          client-certificate: /var/lib/kubernetes/controller-manager.pem
+          client-key: /var/lib/kubernetes/controller-manager-key.pem
+
+  # ----------------------------------------------------------------------------
+  # Kubeconfig: kube-scheduler
+  # ----------------------------------------------------------------------------
+  - path: /var/lib/kubernetes/kube-scheduler.kubeconfig
+    permissions: "0600"
+    content: |
+      apiVersion: v1
+      kind: Config
+      clusters:
+      - cluster:
+          certificate-authority: /var/lib/kubernetes/root-ca.pem
+          server: https://127.0.0.1:6443
+        name: local-cluster
+      contexts:
+      - context:
+          cluster: local-cluster
+          user: system:kube-scheduler
+        name: default
+      current-context: default
+      users:
+      - name: system:kube-scheduler
+        user:
+          client-certificate: /var/lib/kubernetes/scheduler.pem
+          client-key: /var/lib/kubernetes/scheduler-key.pem
+
+  # ----------------------------------------------------------------------------
+  # Kubeconfig: admin (For root kubectl usage on the VM)
+  # ----------------------------------------------------------------------------
+  - path: /root/.kube/config
+    permissions: "0600"
+    content: |
+      apiVersion: v1
+      kind: Config
+      clusters:
+      - cluster:
+          certificate-authority: /var/lib/kubernetes/root-ca.pem
+          server: https://127.0.0.1:6443
+        name: local-cluster
+      contexts:
+      - context:
+          cluster: local-cluster
+          user: admin
+        name: default
+      current-context: default
+      users:
+      - name: admin
+        user:
+          client-certificate: /var/lib/kubernetes/admin-kubectl.pem
+          client-key: /var/lib/kubernetes/admin-kubectl-key.pem
+
+  # ----------------------------------------------------------------------------
+  # 1. kube-apiserver Systemd Unit
+  # ----------------------------------------------------------------------------
+  - path: /etc/systemd/system/kube-apiserver.service
+    content: |
+      [Unit]
+      Description=Kubernetes API Server
+      Documentation=https://github.com/kubernetes/kubernetes
+      After=network.target
+
+      [Service]
+      EnvironmentFile=-/etc/default/kube-apiserver
+      ExecStart=/usr/local/bin/kube-apiserver \
+        --advertise-address=${NODE_IP} \
+        --allow-privileged=true \
+        --audit-log-maxage=30 \
+        --audit-log-maxbackup=3 \
+        --audit-log-maxsize=100 \
+        --audit-log-path=/var/log/audit.log \
+        --authorization-mode=Node,RBAC \
+        --bind-address=0.0.0.0 \
+        --client-ca-file=/var/lib/kubernetes/root-ca.pem \
+        --enable-admission-plugins=NamespaceLifecycle,NodeRestriction,LimitRanger,ServiceAccount,DefaultStorageClass,ResourceQuota \
+        --etcd-cafile=/var/lib/kubernetes/root-ca.pem \
+        --etcd-certfile=/var/lib/kubernetes/apiserver-etcd.pem \
+        --etcd-keyfile=/var/lib/kubernetes/apiserver-etcd-key.pem \
+        --etcd-servers=https://10.240.0.10:2379,https://10.240.0.11:2379,https://10.240.0.12:2379 \
+        --event-ttl=1h \
+        --kubelet-certificate-authority=/var/lib/kubernetes/root-ca.pem \
+        --kubelet-client-certificate=/var/lib/kubernetes/apiserver-kubelet-client.pem \
+        --kubelet-client-key=/var/lib/kubernetes/apiserver-kubelet-client-key.pem \
+        --runtime-config=api/all=true \
+        --service-account-key-file=/var/lib/kubernetes/service-account.pem \
+        --service-account-signing-key-file=/var/lib/kubernetes/service-account.key \
+        --service-account-issuer=https://kubernetes.default.svc.cluster.local \
+        --service-cluster-ip-range=10.32.0.0/24 \
+        --service-node-port-range=30000-32767 \
+        --tls-cert-file=/var/lib/kubernetes/apiserver-kube.pem \
+        --tls-private-key-file=/var/lib/kubernetes/apiserver-kube-key.pem \
+        --v=2
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # ----------------------------------------------------------------------------
+  # 2. kube-controller-manager Systemd Unit
+  # ----------------------------------------------------------------------------
+  - path: /etc/systemd/system/kube-controller-manager.service
+    content: |
+      [Unit]
+      Description=Kubernetes Controller Manager
+      Documentation=https://github.com/kubernetes/kubernetes
+      After=network.target
+
+      [Service]
+      ExecStart=/usr/local/bin/kube-controller-manager \
+        --bind-address=0.0.0.0 \
+        --cluster-cidr=10.200.0.0/16 \
+        --cluster-name=kubernetes \
+        --cluster-signing-cert-file=/var/lib/kubernetes/root-ca.pem \
+        --cluster-signing-key-file=/var/lib/kubernetes/root-ca-key.pem \
+        --kubeconfig=/var/lib/kubernetes/kube-controller-manager.kubeconfig \
+        --leader-elect=true \
+        --root-ca-file=/var/lib/kubernetes/root-ca.pem \
+        --service-account-private-key-file=/var/lib/kubernetes/service-account.key \
+        --service-cluster-ip-range=10.32.0.0/24 \
+        --use-service-account-credentials=true \
+        --v=2
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # ----------------------------------------------------------------------------
+  # 3. kube-scheduler Systemd Unit
+  # ----------------------------------------------------------------------------
+  - path: /etc/systemd/system/kube-scheduler.service
+    content: |
+      [Unit]
+      Description=Kubernetes Scheduler
+      Documentation=https://github.com/kubernetes/kubernetes
+      After=network.target
+
+      [Service]
+      ExecStart=/usr/local/bin/kube-scheduler \
+        --config=/etc/kubernetes/config/kube-scheduler.yaml \
+        --v=2
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /tmp/calico_values.yaml
+    content: |
+      installation:
+        cni:
+          type: Calico
+        calicoNetwork:
+          bgp: Disabled
+          ipPools:
+          - cidr: "10.200.0.0/24"
+            encapsulation: VXLAN
+runcmd:
+  - |
+    set -euo pipefail
+
+    # 1. Apply Kernel modules and sysctl configurations
+    modprobe overlay
+    modprobe br_netfilter
+    sysctl --system
+
+    # 2. Detect node IP and write to EnvironmentFile
+    NODE_IP=$(ip -4 -brief addr show scope global | awk '{print $3}' | cut -d/ -f1 | head -n1)
+    echo "NODE_IP=${NODE_IP}" > /etc/default/kube-apiserver
+    NODE_NAME=$(hostname -s)
+    NODE_INDEX=$(echo "${NODE_NAME}" | cut -d'-' -f2)
+
+
+    # 3. Create required directories
+    mkdir -p /var/lib/kubernetes /etc/kubernetes/config /usr/local/bin /root/.kube
+
+    # 4. Download binaries from host HTTP server (10.240.0.1:8080/binaries/)
+    HOST_SERVER="http://10.240.0.1:8080"
+    echo "Fetching Kubernetes binaries from local host server..."
+    curl -fsSL -o /usr/local/bin/kube-apiserver "${HOST_SERVER}/binaries/kube-apiserver"
+    curl -fsSL -o /usr/local/bin/kube-controller-manager "${HOST_SERVER}/binaries/kube-controller-manager"
+    curl -fsSL -o /usr/local/bin/kube-scheduler "${HOST_SERVER}/binaries/kube-scheduler"
+    curl -fsSL -o /usr/local/bin/kubectl "${HOST_SERVER}/binaries/kubectl"
+    chmod +x /usr/local/bin/kube-apiserver /usr/local/bin/kube-controller-manager /usr/local/bin/kube-scheduler /usr/local/bin/kubectl
+
+    # 5. Fetch Certificates & Keys from host HTTP server (10.240.0.1:8080/pki/)
+    echo "Fetching certificates from local host server..."
+    curl -fsSL -o /var/lib/kubernetes/root-ca.pem "${HOST_SERVER}/pki/root-ca/root-ca.pem"
+    curl -fsSL -o /var/lib/kubernetes/root-ca-key.pem "${HOST_SERVER}/pki/root-ca/root-ca-key.pem"
+    curl -fsSL -o /var/lib/kubernetes/apiserver-kube.pem "${HOST_SERVER}/pki/apiserver/apiserver-kube.pem"
+    curl -fsSL -o /var/lib/kubernetes/apiserver-kube-key.pem "${HOST_SERVER}/pki/apiserver/apiserver-kube-key.pem"
+    curl -fsSL -o /var/lib/kubernetes/apiserver-etcd.pem "${HOST_SERVER}/pki/apiserver/apiserver-etcd.pem"
+    curl -fsSL -o /var/lib/kubernetes/apiserver-etcd-key.pem "${HOST_SERVER}/pki/apiserver/apiserver-etcd-key.pem"
+    curl -fsSL -o /var/lib/kubernetes/apiserver-kubelet-client.pem "${HOST_SERVER}/pki/apiserver/apiserver-kubelet-client.pem"
+    curl -fsSL -o /var/lib/kubernetes/apiserver-kubelet-client-key.pem "${HOST_SERVER}/pki/apiserver/apiserver-kubelet-client-key.pem"
+    curl -fsSL -o /var/lib/kubernetes/controller-manager.pem "${HOST_SERVER}/pki/controller-manager/controller-manager.pem"
+    curl -fsSL -o /var/lib/kubernetes/controller-manager-key.pem "${HOST_SERVER}/pki/controller-manager/controller-manager-key.pem"
+    curl -fsSL -o /var/lib/kubernetes/scheduler.pem "${HOST_SERVER}/pki/scheduler/scheduler.pem"
+    curl -fsSL -o /var/lib/kubernetes/scheduler-key.pem "${HOST_SERVER}/pki/scheduler/scheduler-key.pem"
+    curl -fsSL -o /var/lib/kubernetes/admin-kubectl.pem "${HOST_SERVER}/pki/admin-kubectl/admin-kubectl.pem"
+    curl -fsSL -o /var/lib/kubernetes/admin-kubectl-key.pem "${HOST_SERVER}/pki/admin-kubectl/admin-kubectl-key.pem"
+    curl -fsSL -o /var/lib/kubernetes/service-account.key "${HOST_SERVER}/pki/service-account/service-account-key.pem"
+    curl -fsSL -o /var/lib/kubernetes/service-account.pem "${HOST_SERVER}/pki/service-account/service-account.pem"
+
+    # install helm
+    curl -sSL "http://10.240.0.1:8080/binaries/helm.tar.gz" -o /tmp/helm.tar.gz
+    tar -xzf /tmp/helm.tar.gz -C /tmp/
+    find /tmp -type f -name "helm" -exec mv {} /usr/local/bin/ \;
+
+    export KUBECONFIG="/root/.kube/config"
+
+    # 6. Secure sensitive private keys & configs
+    chmod 600 /var/lib/kubernetes/*-key.pem /var/lib/kubernetes/*.kubeconfig /root/.kube/config /var/lib/kubernetes/service-account.key
+
+    # 7. Reload systemd and start all control plane services
+    systemctl daemon-reload
+    systemctl enable --now kube-apiserver kube-controller-manager kube-scheduler
+
+    if [ "$NODE_INDEX" -eq 0 ]; then
+      echo "==> Primary control plane: waiting for API server..."
+      until kubectl get nodes &>/dev/null; do
+        sleep 2
+      done
+
+      kubectl create namespace tigera-operator || true
+      helm repo add projectcalico https://docs.tigera.io/calico/charts
+      echo "==> installing calico crds ..."
+      helm upgrade --install calico-crds projectcalico/crd.projectcalico.org.v1 --version v3.32.2 --namespace tigera-operator --atomic --debug --take-ownership
+      echo "==> installing calico ..."
+      helm upgrade --install calico projectcalico/tigera-operator --version v3.32.2 --namespace tigera-operator -f /tmp/calico_values.yaml --debug --take-ownership
+    fi

@@ -1,0 +1,12 @@
+config:
+  limits.cpu: "2"
+  limits.memory: "2GiB"
+devices:
+  root:
+    path: /
+    pool: default
+    type: disk
+  eth0:
+    name: eth0
+    network: k8sbr0
+    type: nic

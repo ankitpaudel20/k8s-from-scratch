@@ -1,0 +1,8 @@
+{
+  "CN": "etcd-2",
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "hosts": ["127.0.0.1", "10.240.0.12", "etcd-2", "etcd-2.k8s.local"]
+}

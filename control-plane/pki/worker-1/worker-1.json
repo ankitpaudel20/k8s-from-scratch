@@ -1,0 +1,16 @@
+{
+  "CN": "system:node:worker-1",
+  "hosts": [
+    "worker-1",
+    "10.240.0.31"
+  ],
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+    {
+      "O": "system:nodes"
+    }
+  ]
+}
