@@ -1,8 +1,8 @@
 # ------------------------------------------------------------------------------
 # Downloaded Binaries and Archives
 # ------------------------------------------------------------------------------
-control-plane/binaries/*
-!control-plane/binaries/.gitkeep
+**/binaries/*
+!**/binaries/.gitkeep
 *.tar.gz
 *.tgz
 *.tar
@@ -11,9 +11,9 @@ control-plane/binaries/*
 # PKI Certificates, Private Keys, and CSRs
 # ------------------------------------------------------------------------------
 # Exclude generated credentials (keeps *.json specs, gencert.sh, del-cert.sh, readme.md)
-control-plane/pki/**/*.pem
-control-plane/pki/**/*.key
-control-plane/pki/**/*.csr
+**/pki/**/*.pem
+**/pki/**/*.key
+**/pki/**/*.csr
 *.pem
 *.key
 *.csr
@@ -21,8 +21,8 @@ control-plane/pki/**/*.csr
 # ------------------------------------------------------------------------------
 # Kubeconfigs & Cluster Credentials
 # ------------------------------------------------------------------------------
-control-plane/kubeconfig/*
-!control-plane/kubeconfig/.gitkeep
+**/kubeconfig/*
+!**/kubeconfig/.gitkeep
 *.kubeconfig
 
 # ------------------------------------------------------------------------------

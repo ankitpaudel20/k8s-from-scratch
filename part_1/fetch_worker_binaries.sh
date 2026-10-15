@@ -39,6 +39,12 @@ if [ ! -f binaries/crictl.tar.gz ]; then
   curl -fsSL -o "${BIN_DIR}/crictl.tar.gz" \
     "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz"
 fi
-
+# 4. CNI Plugins
+CNI_VERSION="v1.9.1"
+echo "--> [5/5] Fetching CNI plugins (${CNI_VERSION})..."
+if [ ! -f "${BIN_DIR}/cni.tgz" ]; then
+  curl -fsSL -o "${BIN_DIR}/cni.tgz" \
+    "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-amd64-${CNI_VERSION}.tgz"
+fi
 echo ""
 echo "Done! All worker binaries cached in ${BIN_DIR} for the local HTTP server."

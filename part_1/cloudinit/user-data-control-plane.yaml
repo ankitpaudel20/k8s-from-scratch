@@ -28,6 +28,9 @@ write_files:
 
   # ----------------------------------------------------------------------------
   # Kube-Scheduler Component Configuration File
+  # kube-scheduler is responsible for scheduling pods onto nodes in the cluster.
+  # this essentially initiates a live watch/update connection to the apiserver to receive updates on changes of pod and node objects, decides which pod needs to go to which node based on some algorithm, and sends request to apiserver saying "here's the pod you need to schedule onto this node".
+  # The request thats sent to the apiserver essentially says, populate this pods's node section to this node's name, and the kubelet which also has this update/watch connection open to the apiserver to receive updates on changes of pod which has its node section set to the node of tbe kubelet. the kubelet then does the actual startup and running of the pod in the node.
   # ----------------------------------------------------------------------------
   - path: /etc/kubernetes/config/kube-scheduler.yaml
     content: |
@@ -40,6 +43,9 @@ write_files:
 
   # ----------------------------------------------------------------------------
   # Kubeconfig: kube-controller-manager
+  # This component is responsible for managing high level kubernetes objects like `deployment`, `replicaset`, `statefulset`, `daemonset`, Endpoint, Node, Namespace, PV and PVC objects.
+  # so essentially, it listens for changes to things like deployment, and ensures the new replicaset is created or updated as needed, and the same for replicaset, if a pod dies, it will be replaced by the replicaset controller which is running as one of the goroutines inside this process.
+  # Similarly, many of the default magic that kubernetes does like cascading deletes, resource quotas, and pod affinity/anti-affinity rules are handled by the kube-controller-manager.
   # ----------------------------------------------------------------------------
   - path: /var/lib/kubernetes/kube-controller-manager.kubeconfig
     permissions: "0600"
@@ -115,6 +121,9 @@ write_files:
 
   # ----------------------------------------------------------------------------
   # 1. kube-apiserver Systemd Unit
+  # This is the main kubernetes API server process that serves as the control plane for the cluster.
+  # This is the hub for all the other components of the cluster, including the kubelet, kube-proxy and kube-controller-manager and the kubelet.
+  # Only this is responsible for communication with the etcd, so all the cluster modifications and reads are always routed through this.
   # ----------------------------------------------------------------------------
   - path: /etc/systemd/system/kube-apiserver.service
     content: |
@@ -208,87 +217,101 @@ write_files:
 
       [Install]
       WantedBy=multi-user.target
-  - path: /tmp/calico_values.yaml
+
+  # Generate environment variables
+  - path: /opt/generate-env.sh
+    permissions: "0755"
     content: |
-      installation:
-        cni:
-          type: Calico
-        calicoNetwork:
-          bgp: Disabled
-          ipPools:
-          - cidr: "10.200.0.0/24"
-            encapsulation: VXLAN
+      #!/bin/bash
+      set -euo pipefail
+
+      # Generate dynamic variables
+      NODE_NAME=$(hostname -s)
+      NODE_INDEX=$(echo "${NODE_NAME}" | cut -d'-' -f2)
+      NODE_IP=$(ip -4 -brief addr show scope global | awk '{print $3}' | cut -d/ -f1 | head -n1)
+
+      cat << EOF > /opt/config.env
+      HOST_SERVER="http://10.240.0.1:8080"
+      NODE_NAME="${NODE_NAME}"
+      NODE_INDEX="${NODE_INDEX}"
+      NODE_IP="${NODE_IP}"
+      EOF
+
+      # Write node IP to systemd environment file for kube-apiserver
+      echo "NODE_IP=${NODE_IP}" > /etc/default/kube-apiserver
+
+  - path: /opt/bootstrap.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      # Load variables
+      source /opt/config.env
+
+      # 1. Apply Kernel modules and sysctl configurations
+      modprobe overlay
+      modprobe br_netfilter
+      sysctl --system
+
+      # 3. Create required directories
+      mkdir -p /var/lib/kubernetes /etc/kubernetes/config /usr/local/bin /root/.kube
+
+      # 4. Download binaries from host HTTP server
+      echo "Fetching Kubernetes binaries from local host server..."
+      curl -fsSL -o /usr/local/bin/kube-apiserver "${HOST_SERVER}/binaries/kube-apiserver"
+      curl -fsSL -o /usr/local/bin/kube-controller-manager "${HOST_SERVER}/binaries/kube-controller-manager"
+      curl -fsSL -o /usr/local/bin/kube-scheduler "${HOST_SERVER}/binaries/kube-scheduler"
+      curl -fsSL -o /usr/local/bin/kubectl "${HOST_SERVER}/binaries/kubectl"
+      chmod +x /usr/local/bin/kube-apiserver /usr/local/bin/kube-controller-manager /usr/local/bin/kube-scheduler /usr/local/bin/kubectl
+
+      # 5. Fetch Certificates & Keys from host HTTP server
+      echo "Fetching certificates from local host server..."
+      curl -fsSL -o /var/lib/kubernetes/root-ca.pem "${HOST_SERVER}/pki/root-ca/root-ca.pem"
+      curl -fsSL -o /var/lib/kubernetes/root-ca-key.pem "${HOST_SERVER}/pki/root-ca/root-ca-key.pem"
+      curl -fsSL -o /var/lib/kubernetes/apiserver-kube.pem "${HOST_SERVER}/pki/apiserver/apiserver-kube.pem"
+      curl -fsSL -o /var/lib/kubernetes/apiserver-kube-key.pem "${HOST_SERVER}/pki/apiserver/apiserver-kube-key.pem"
+      curl -fsSL -o /var/lib/kubernetes/apiserver-etcd.pem "${HOST_SERVER}/pki/apiserver/apiserver-etcd.pem"
+      curl -fsSL -o /var/lib/kubernetes/apiserver-etcd-key.pem "${HOST_SERVER}/pki/apiserver/apiserver-etcd-key.pem"
+      curl -fsSL -o /var/lib/kubernetes/apiserver-kubelet-client.pem "${HOST_SERVER}/pki/apiserver/apiserver-kubelet-client.pem"
+      curl -fsSL -o /var/lib/kubernetes/apiserver-kubelet-client-key.pem "${HOST_SERVER}/pki/apiserver/apiserver-kubelet-client-key.pem"
+      curl -fsSL -o /var/lib/kubernetes/controller-manager.pem "${HOST_SERVER}/pki/controller-manager/controller-manager.pem"
+      curl -fsSL -o /var/lib/kubernetes/controller-manager-key.pem "${HOST_SERVER}/pki/controller-manager/controller-manager-key.pem"
+      curl -fsSL -o /var/lib/kubernetes/scheduler.pem "${HOST_SERVER}/pki/scheduler/scheduler.pem"
+      curl -fsSL -o /var/lib/kubernetes/scheduler-key.pem "${HOST_SERVER}/pki/scheduler/scheduler-key.pem"
+      curl -fsSL -o /var/lib/kubernetes/admin-kubectl.pem "${HOST_SERVER}/pki/admin-kubectl/admin-kubectl.pem"
+      curl -fsSL -o /var/lib/kubernetes/admin-kubectl-key.pem "${HOST_SERVER}/pki/admin-kubectl/admin-kubectl-key.pem"
+      curl -fsSL -o /var/lib/kubernetes/service-account.key "${HOST_SERVER}/pki/service-account/service-account-key.pem"
+      curl -fsSL -o /var/lib/kubernetes/service-account.pem "${HOST_SERVER}/pki/service-account/service-account.pem"
+
+      # install helm
+      curl -sSL "${HOST_SERVER}/binaries/helm.tar.gz" -o /tmp/helm.tar.gz
+      tar -xzf /tmp/helm.tar.gz -C /tmp/
+      find /tmp -type f -name "helm" -exec mv {} /usr/local/bin/ \;
+
+      export KUBECONFIG="/root/.kube/config"
+
+      # 6. Secure sensitive private keys & configs
+      chmod 600 /var/lib/kubernetes/*-key.pem /var/lib/kubernetes/*.kubeconfig /root/.kube/config /var/lib/kubernetes/service-account.key
+
+      # 7. Reload systemd and start all control plane services
+      systemctl daemon-reload
+      systemctl enable --now kube-apiserver kube-controller-manager kube-scheduler
+
+      if [ "$NODE_INDEX" -eq 0 ]; then
+        echo "==> Primary control plane: waiting for API server..."
+        until kubectl get nodes &>/dev/null; do
+          sleep 2
+        done
+        echo "==> Kubernetes Control Plane initialized successfully."
+
+        # 8. Deploy CoreDNS for in-cluster DNS resolution
+        echo "==> Fetching and deploying CoreDNS..."
+        curl -fsSL -o /tmp/coredns.yaml "${HOST_SERVER}/coredns/coredns.yaml"
+        kubectl apply -f /tmp/coredns.yaml
+        echo "==> CoreDNS deployed."
+      fi
+
 runcmd:
-  - |
-    set -euo pipefail
-
-    # 1. Apply Kernel modules and sysctl configurations
-    modprobe overlay
-    modprobe br_netfilter
-    sysctl --system
-
-    # 2. Detect node IP and write to EnvironmentFile
-    NODE_IP=$(ip -4 -brief addr show scope global | awk '{print $3}' | cut -d/ -f1 | head -n1)
-    echo "NODE_IP=${NODE_IP}" > /etc/default/kube-apiserver
-    NODE_NAME=$(hostname -s)
-    NODE_INDEX=$(echo "${NODE_NAME}" | cut -d'-' -f2)
-
-
-    # 3. Create required directories
-    mkdir -p /var/lib/kubernetes /etc/kubernetes/config /usr/local/bin /root/.kube
-
-    # 4. Download binaries from host HTTP server (10.240.0.1:8080/binaries/)
-    HOST_SERVER="http://10.240.0.1:8080"
-    echo "Fetching Kubernetes binaries from local host server..."
-    curl -fsSL -o /usr/local/bin/kube-apiserver "${HOST_SERVER}/binaries/kube-apiserver"
-    curl -fsSL -o /usr/local/bin/kube-controller-manager "${HOST_SERVER}/binaries/kube-controller-manager"
-    curl -fsSL -o /usr/local/bin/kube-scheduler "${HOST_SERVER}/binaries/kube-scheduler"
-    curl -fsSL -o /usr/local/bin/kubectl "${HOST_SERVER}/binaries/kubectl"
-    chmod +x /usr/local/bin/kube-apiserver /usr/local/bin/kube-controller-manager /usr/local/bin/kube-scheduler /usr/local/bin/kubectl
-
-    # 5. Fetch Certificates & Keys from host HTTP server (10.240.0.1:8080/pki/)
-    echo "Fetching certificates from local host server..."
-    curl -fsSL -o /var/lib/kubernetes/root-ca.pem "${HOST_SERVER}/pki/root-ca/root-ca.pem"
-    curl -fsSL -o /var/lib/kubernetes/root-ca-key.pem "${HOST_SERVER}/pki/root-ca/root-ca-key.pem"
-    curl -fsSL -o /var/lib/kubernetes/apiserver-kube.pem "${HOST_SERVER}/pki/apiserver/apiserver-kube.pem"
-    curl -fsSL -o /var/lib/kubernetes/apiserver-kube-key.pem "${HOST_SERVER}/pki/apiserver/apiserver-kube-key.pem"
-    curl -fsSL -o /var/lib/kubernetes/apiserver-etcd.pem "${HOST_SERVER}/pki/apiserver/apiserver-etcd.pem"
-    curl -fsSL -o /var/lib/kubernetes/apiserver-etcd-key.pem "${HOST_SERVER}/pki/apiserver/apiserver-etcd-key.pem"
-    curl -fsSL -o /var/lib/kubernetes/apiserver-kubelet-client.pem "${HOST_SERVER}/pki/apiserver/apiserver-kubelet-client.pem"
-    curl -fsSL -o /var/lib/kubernetes/apiserver-kubelet-client-key.pem "${HOST_SERVER}/pki/apiserver/apiserver-kubelet-client-key.pem"
-    curl -fsSL -o /var/lib/kubernetes/controller-manager.pem "${HOST_SERVER}/pki/controller-manager/controller-manager.pem"
-    curl -fsSL -o /var/lib/kubernetes/controller-manager-key.pem "${HOST_SERVER}/pki/controller-manager/controller-manager-key.pem"
-    curl -fsSL -o /var/lib/kubernetes/scheduler.pem "${HOST_SERVER}/pki/scheduler/scheduler.pem"
-    curl -fsSL -o /var/lib/kubernetes/scheduler-key.pem "${HOST_SERVER}/pki/scheduler/scheduler-key.pem"
-    curl -fsSL -o /var/lib/kubernetes/admin-kubectl.pem "${HOST_SERVER}/pki/admin-kubectl/admin-kubectl.pem"
-    curl -fsSL -o /var/lib/kubernetes/admin-kubectl-key.pem "${HOST_SERVER}/pki/admin-kubectl/admin-kubectl-key.pem"
-    curl -fsSL -o /var/lib/kubernetes/service-account.key "${HOST_SERVER}/pki/service-account/service-account-key.pem"
-    curl -fsSL -o /var/lib/kubernetes/service-account.pem "${HOST_SERVER}/pki/service-account/service-account.pem"
-
-    # install helm
-    curl -sSL "http://10.240.0.1:8080/binaries/helm.tar.gz" -o /tmp/helm.tar.gz
-    tar -xzf /tmp/helm.tar.gz -C /tmp/
-    find /tmp -type f -name "helm" -exec mv {} /usr/local/bin/ \;
-
-    export KUBECONFIG="/root/.kube/config"
-
-    # 6. Secure sensitive private keys & configs
-    chmod 600 /var/lib/kubernetes/*-key.pem /var/lib/kubernetes/*.kubeconfig /root/.kube/config /var/lib/kubernetes/service-account.key
-
-    # 7. Reload systemd and start all control plane services
-    systemctl daemon-reload
-    systemctl enable --now kube-apiserver kube-controller-manager kube-scheduler
-
-    if [ "$NODE_INDEX" -eq 0 ]; then
-      echo "==> Primary control plane: waiting for API server..."
-      until kubectl get nodes &>/dev/null; do
-        sleep 2
-      done
-
-      kubectl create namespace tigera-operator || true
-      helm repo add projectcalico https://docs.tigera.io/calico/charts
-      echo "==> installing calico crds ..."
-      helm upgrade --install calico-crds projectcalico/crd.projectcalico.org.v1 --version v3.32.2 --namespace tigera-operator --atomic --debug --take-ownership
-      echo "==> installing calico ..."
-      helm upgrade --install calico projectcalico/tigera-operator --version v3.32.2 --namespace tigera-operator -f /tmp/calico_values.yaml --debug --take-ownership
-    fi
+  - /opt/generate-env.sh
+  - /opt/bootstrap.sh

@@ -1,0 +1,109 @@
+#cloud-config
+swap:
+  size: 0
+
+packages:
+  - socat
+  - ipset
+  - curl
+  - tar
+  - apt-transport-https
+
+write_files:
+  - path: /etc/systemd/system/etcd.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=etcd
+      Documentation=https://github.com/etcd-io/etcd
+      After=network.target
+
+      [Service]
+      Type=notify
+      EnvironmentFile=/etc/default/etcd
+      ExecStart=/usr/local/bin/etcd \
+        --name=${NODE_NAME} \
+        --log-format=console \
+        --data-dir=/var/lib/etcd \
+        --initial-advertise-peer-urls=https://${NODE_IP}:2380 \
+        --listen-peer-urls=https://${NODE_IP}:2380 \
+        --listen-client-urls=https://${NODE_IP}:2379,https://127.0.0.1:2379 \
+        --advertise-client-urls=https://${NODE_IP}:2379 \
+        --initial-cluster-token=etcd-cluster-0 \
+        --initial-cluster=etcd-0=https://10.240.0.10:2380,etcd-1=https://10.240.0.11:2380,etcd-2=https://10.240.0.12:2380 \
+        --initial-cluster-state=new \
+        --peer-client-cert-auth=true \
+        --peer-trusted-ca-file=/etc/etcd/ca.pem \
+        --peer-cert-file=/etc/etcd/peer.pem \
+        --peer-key-file=/etc/etcd/peer-key.pem \
+        --client-cert-auth=true \
+        --trusted-ca-file=/etc/etcd/ca.pem \
+        --cert-file=/etc/etcd/server.pem \
+        --key-file=/etc/etcd/server-key.pem
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /opt/generate-env.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      # Generate dynamic variables
+      NODE_NAME=$(uname -n)
+      NODE_IP=$(ip -4 -brief addr show scope global | awk '{print $3}' | cut -d/ -f1 | head -n1)
+
+      cat << EOF > /opt/config.env
+      HOST_SERVER="http://10.240.0.1:8080"
+      NODE_NAME="${NODE_NAME}"
+      NODE_IP="${NODE_IP}"
+      EOF
+
+      # Also write systemd environment variables
+      echo "NODE_NAME=${NODE_NAME}" > /etc/default/etcd
+      echo "NODE_IP=${NODE_IP}" >> /etc/default/etcd
+
+  - path: /opt/bootstrap.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+
+      # Load variables
+      source /opt/config.env
+
+      mkdir -p /etc/etcd
+      chmod 700 /etc/etcd
+
+      # 1. Fetch Root CA
+      curl -sSL "${HOST_SERVER}/pki/root-ca/root-ca.pem" -o /etc/etcd/ca.pem
+
+      # 2. Fetch node-specific certs
+      curl -sSL "${HOST_SERVER}/pki/${NODE_NAME}/${NODE_NAME}-server.pem" -o /etc/etcd/server.pem
+      curl -sSL "${HOST_SERVER}/pki/${NODE_NAME}/${NODE_NAME}-server-key.pem" -o /etc/etcd/server-key.pem
+      curl -sSL "${HOST_SERVER}/pki/${NODE_NAME}/${NODE_NAME}-peer.pem" -o /etc/etcd/peer.pem
+      curl -sSL "${HOST_SERVER}/pki/${NODE_NAME}/${NODE_NAME}-peer-key.pem" -o /etc/etcd/peer-key.pem
+
+      # 3. Lock down private keys
+      chmod 600 /etc/etcd/*-key.pem
+      chmod 644 /etc/etcd/*.pem
+
+      # 4. Download and install pinned etcd binary
+      curl -sSL "${HOST_SERVER}/binaries/etcd.tar.gz" -o /tmp/etcd.tar.gz
+      tar -xzf /tmp/etcd.tar.gz -C /tmp/
+      mv /tmp/etcd*/etcd* /usr/local/bin/
+
+      # 5. Create database directory with strict 700 permissions
+      mkdir -p /var/lib/etcd
+      chmod 700 /var/lib/etcd
+
+      # 6. Reload systemd
+      systemctl daemon-reload
+      systemctl enable --now etcd
+
+runcmd:
+  - /opt/generate-env.sh
+  - /opt/bootstrap.sh
